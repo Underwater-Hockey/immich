@@ -1,0 +1,116 @@
+name: Open upstream PR
+
+# Mirrors a pull request from this fork to the upstream repository.
+#
+# Trigger it either by adding the `upstream` label to a PR in this fork, or by
+# running it manually with the fork PR number. The upstream PR is opened with
+# the same title and body, using this fork's branch as its head.
+#
+# Requires a repository secret named UPSTREAM_PR_TOKEN: a classic personal
+# access token with the `public_repo` scope. A fine-grained token cannot open
+# pull requests on repositories you do not own, so a classic token is needed.
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Fork pull request number to mirror upstream'
+        required: true
+        type: number
+
+permissions: {}
+
+env:
+  UPSTREAM_REPO: immich-app/immich
+  UPSTREAM_BASE: main
+  TRIGGER_LABEL: upstream
+
+jobs:
+  open-upstream-pr:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'upstream'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Read fork pull request
+        id: fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json number,title,body,headRefName,headRepositoryOwner,isDraft,state > pr.json
+
+          state=$(jq -r '.state' pr.json)
+          if [ "$state" != "OPEN" ]; then
+            echo "::error::Fork PR #$PR_NUMBER is $state, not OPEN"
+            exit 1
+          fi
+
+          head_owner=$(jq -r '.headRepositoryOwner.login' pr.json)
+          if [ "$head_owner" != "$GITHUB_REPOSITORY_OWNER" ]; then
+            echo "::error::Fork PR #$PR_NUMBER head branch lives in $head_owner, not $GITHUB_REPOSITORY_OWNER"
+            exit 1
+          fi
+
+          {
+            echo "number=$(jq -r '.number' pr.json)"
+            echo "head=$GITHUB_REPOSITORY_OWNER:$(jq -r '.headRefName' pr.json)"
+            echo "draft=$(jq -r '.isDraft' pr.json)"
+            echo "title<<EOF_TITLE"
+            jq -r '.title' pr.json
+            echo "EOF_TITLE"
+          } >> "$GITHUB_OUTPUT"
+
+          # Rewrite references to upstream issues so they auto-link and auto-close there,
+          # for example "Fixes immich-app/immich#123" becomes "Fixes #123".
+          jq -r '.body // ""' pr.json | sed -E "s#\b${UPSTREAM_REPO//./\\.}\#([0-9]+)#\#\1#g" > body.md
+
+      - name: Open or find upstream pull request
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_PR_TOKEN }}
+          HEAD: ${{ steps.fork.outputs.head }}
+          TITLE: ${{ steps.fork.outputs.title }}
+          DRAFT: ${{ steps.fork.outputs.draft }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Secret UPSTREAM_PR_TOKEN is not set"
+            exit 1
+          fi
+
+          existing=$(gh pr list --repo "$UPSTREAM_REPO" --head "$HEAD" --state open --json url --jq '.[0].url // empty')
+          if [ -n "$existing" ]; then
+            echo "Upstream PR already exists: $existing"
+            echo "url=$existing" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          args=(--repo "$UPSTREAM_REPO" --base "$UPSTREAM_BASE" --head "$HEAD" --title "$TITLE" --body-file body.md)
+          if [ "$DRAFT" = "true" ]; then
+            args+=(--draft)
+          fi
+          url=$(gh pr create "${args[@]}")
+          echo "Opened upstream PR: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Link upstream pull request from the fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.fork.outputs.number }}
+          URL: ${{ steps.upstream.outputs.url }}
+          CREATED: ${{ steps.upstream.outputs.created }}
+        run: |
+          set -euo pipefail
+          if [ "$CREATED" = "true" ]; then
+            body="Opened upstream pull request: $URL"
+          else
+            body="Upstream pull request already exists: $URL"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$body"
