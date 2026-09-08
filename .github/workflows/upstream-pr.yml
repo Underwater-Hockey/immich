@@ -4,7 +4,13 @@ name: Open upstream PR
 #
 # Trigger it either by adding the `upstream` label to a PR in this fork, or by
 # running it manually with the fork PR number. The upstream PR is opened with
-# the same title and body, using this fork's branch as its head.
+# the same title and body, using this fork's branch as its head. If an open
+# upstream PR already exists for the branch, its title and body are synced
+# instead. Re-add the label to sync again after editing the fork PR.
+#
+# Fork-only files (this workflow, CLAUDE.md) must never reach upstream, so the
+# run fails if the branch adds any of them relative to upstream main. Base
+# branches on upstream main, not on this fork's main, to avoid that.
 #
 # Requires a repository secret named UPSTREAM_PR_TOKEN: a classic personal
 # access token with the `public_repo` scope. A fine-grained token cannot open
@@ -26,6 +32,8 @@ env:
   UPSTREAM_REPO: immich-app/immich
   UPSTREAM_BASE: main
   TRIGGER_LABEL: upstream
+  # Extended regex, matched against whole paths of files the branch changes upstream.
+  FORK_ONLY_PATHS: '\.github/workflows/upstream-pr\.yml|CLAUDE\.md'
 
 jobs:
   open-upstream-pr:
@@ -66,8 +74,18 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           # Rewrite references to upstream issues so they auto-link and auto-close there,
-          # for example "Fixes immich-app/immich#123" becomes "Fixes #123".
+          # for example "Fixes immich-app/immich#123" becomes "Fixes #123". Drop any
+          # line carrying a Claude Code session link, plus a horizontal rule left
+          # dangling at the end by removing the auto-appended footer.
           jq -r '.body // ""' pr.json | sed -E "s#\b${UPSTREAM_REPO//./\\.}\#([0-9]+)#\#\1#g" > body.md
+          python3 - <<'PY'
+          import re
+          lines = open('body.md').read().split('\n')
+          lines = [line for line in lines if 'claude.ai/code/session_' not in line]
+          while lines and re.fullmatch(r'\s*(---|\*\*\*)?\s*', lines[-1]):
+              lines.pop()
+          open('body.md', 'w').write('\n'.join(lines) + '\n')
+          PY
 
       - name: Open or find upstream pull request
         id: upstream
@@ -83,9 +101,19 @@ jobs:
             exit 1
           fi
 
+          # Refuse to mirror a branch that would add fork-only files upstream.
+          leaked=$(gh api --paginate "repos/$UPSTREAM_REPO/compare/$UPSTREAM_BASE...$HEAD" \
+            --jq '.files[]?.filename' | grep -Ex "$FORK_ONLY_PATHS" || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::Branch adds fork-only files relative to $UPSTREAM_REPO:$UPSTREAM_BASE. Rebase it onto upstream main first."
+            echo "$leaked"
+            exit 1
+          fi
+
           existing=$(gh pr list --repo "$UPSTREAM_REPO" --head "$HEAD" --state open --json url --jq '.[0].url // empty')
           if [ -n "$existing" ]; then
-            echo "Upstream PR already exists: $existing"
+            echo "Upstream PR already exists, syncing title and body: $existing"
+            gh pr edit "$existing" --repo "$UPSTREAM_REPO" --title "$TITLE" --body-file body.md
             echo "url=$existing" >> "$GITHUB_OUTPUT"
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -111,6 +139,6 @@ jobs:
           if [ "$CREATED" = "true" ]; then
             body="Opened upstream pull request: $URL"
           else
-            body="Upstream pull request already exists: $URL"
+            body="Synced title and body to the existing upstream pull request: $URL"
           fi
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$body"
