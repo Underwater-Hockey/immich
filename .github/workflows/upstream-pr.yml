@@ -110,11 +110,20 @@ jobs:
             exit 1
           fi
 
-          existing=$(gh pr list --repo "$UPSTREAM_REPO" --head "$HEAD" --state open --json url --jq '.[0].url // empty')
-          if [ -n "$existing" ]; then
-            echo "Upstream PR already exists, syncing title and body: $existing"
-            gh pr edit "$existing" --repo "$UPSTREAM_REPO" --title "$TITLE" --body-file body.md
-            echo "url=$existing" >> "$GITHUB_OUTPUT"
+          # gh's --head filter matches a bare branch name only, so a cross-repo
+          # "owner:branch" head never matches. List this token's open PRs and
+          # match the head repository owner and branch explicitly instead.
+          head_owner=${HEAD%%:*}
+          head_branch=${HEAD#*:}
+          gh pr list --repo "$UPSTREAM_REPO" --author "@me" --state open --limit 100 \
+            --json number,url,headRefName,headRepositoryOwner > existing.json
+          existing_number=$(jq -r --arg owner "$head_owner" --arg branch "$head_branch" \
+            '[.[] | select(.headRepositoryOwner.login == $owner and .headRefName == $branch)][0].number // empty' existing.json)
+          if [ -n "$existing_number" ]; then
+            existing_url=$(jq -r --argjson n "$existing_number" '.[] | select(.number == $n) | .url' existing.json)
+            echo "Upstream PR already exists, syncing title and body: $existing_url"
+            gh pr edit "$existing_number" --repo "$UPSTREAM_REPO" --title "$TITLE" --body-file body.md
+            echo "url=$existing_url" >> "$GITHUB_OUTPUT"
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
